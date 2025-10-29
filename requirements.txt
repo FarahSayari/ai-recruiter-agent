@@ -1,0 +1,13 @@
+langgraph
+langchain
+sentence-transformers
+transformers
+chromadb
+qdrant-client
+pdfplumber
+pandas
+numpy
+scikit-learn
+matplotlib
+torch
+streamlit
