@@ -10,7 +10,7 @@ from .storage import CVStorage
 from qdrant_client import QdrantClient
 try:
     # Relative import since we are inside the src package
-    from .agentGraph import run_agent, get_bert_embeddings
+    from .agentGraph import run_agent, get_bert_embeddings, run_agent_email
 except ImportError:
     # Fallback: add this directory to path then plain import
     import sys
@@ -52,11 +52,18 @@ class CandidateResult(BaseModel):
 class AgentResponse(BaseModel):
     results: List[CandidateResult]
 
+class EmailRequest(BaseModel):
+    job_description: str
+    top_k: int = 5
+    subject: str | None = None
+    role: str | None = None
+    reply_to: str | None = None  # optional Reply-To header
+
 # --- Chat models and agent wiring ---
 try:
-    from .llm_agent import RecruiterAgent
+    from .llm_agent import RecruiterAgent, parse_requested_top_k
 except ImportError:
-    from llm_agent import RecruiterAgent
+    from llm_agent import RecruiterAgent, parse_requested_top_k
 
 class ChatRequest(BaseModel):
     message: str
@@ -66,6 +73,12 @@ class ChatResponse(BaseModel):
 
 agent = RecruiterAgent()
 # --- end chat wiring ---
+
+# --- email sender wiring ---
+try:
+    from .mailer import send_email, render_invite_subject, render_invite_body
+except ImportError:
+    from mailer import send_email, render_invite_subject, render_invite_body
 
 @app.get("/health")
 def health():
@@ -138,6 +151,13 @@ async def chat(
 
         user_msg = (message or "").strip()
 
+        # Attempt to extract explicit candidate count from message
+        requested_k = None
+        try:
+            requested_k = parse_requested_top_k(user_msg)
+        except Exception:
+            requested_k = None
+
         # If a PDF file is provided, use it as job description (optionally combined with message)
         if file is not None:
             raw = await file.read()
@@ -152,13 +172,13 @@ async def chat(
             # Optional free-text notes from the message
             if user_msg:
                 job_desc = f"{job_desc}\n\nAdditional notes: {user_msg}"
-            # Infer desired number of candidates from the message (default handled in agent)
-            k = agent.infer_top_k_from_text(user_msg)
+            # Use explicitly requested top_k if present else infer
+            k = requested_k or agent.infer_top_k_from_text(user_msg)
             reply = agent.handle_job_description(job_desc, top_k=k)
             return {"reply": reply}
 
         # No file: normal chat flow (intent detection + RAG if needed), with internal top_k inference
-        reply = agent.handle_message(user_msg)
+        reply = agent.handle_message(user_msg, forced_top_k=requested_k)
         return {"reply": reply}
     except HTTPException:
         raise
@@ -189,4 +209,56 @@ def query_agent(request: JobRequest):
         return {"results": results}
     except Exception as e:
         logging.exception("Agent error")
+        raise HTTPException(status_code=500, detail=str(e))
+@app.post("/email")
+def email():
+    summary = run_agent_email()
+    return {"summary": summary}
+
+
+@app.post("/send_emails")
+def send_emails(req: EmailRequest):
+    """Run candidate search then send (or dry-run) emails to top matches."""
+    try:
+        # Run retrieval (prefer with_explain if available)
+        try:
+            results: List[Dict[str, Any]] = run_agent(
+                req.job_description, top_k=req.top_k, with_explain=True
+            )
+        except TypeError:
+            results = run_agent(req.job_description, top_k=req.top_k)
+
+        storage = CVStorage()
+        subject = req.subject or render_invite_subject(req.role)
+        sent = 0
+        attempted = 0
+        failures: list[dict] = []
+
+        for r in results[: req.top_k]:
+            cid = r.get("candidate_id")
+            if cid is None:
+                continue
+            email_addr = r.get("email") or storage.get_email_by_candidate_id(cid)
+            if not email_addr:
+                failures.append({"candidate_id": cid, "reason": "no email"})
+                continue
+            body = render_invite_body(r.get("name"), req.job_description, req.reply_to)
+            attempted += 1
+            try:
+                if send_email(email_addr, subject, body, reply_to=req.reply_to):
+                    sent += 1
+                else:
+                    failures.append({"candidate_id": cid, "reason": "send failed"})
+            except Exception as e:
+                failures.append({"candidate_id": cid, "reason": str(e)})
+
+        return {
+            "attempted": attempted,
+            "sent": sent,
+            "failures": failures,
+            "from_email": os.getenv("FROM_EMAIL", os.getenv("SMTP_USER", "")),
+            "dry_run": os.getenv("EMAIL_DRY_RUN", "1") == "1",
+        }
+    except Exception as e:
+        logging.exception("Send emails error")
         raise HTTPException(status_code=500, detail=str(e))

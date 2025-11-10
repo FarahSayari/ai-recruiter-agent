@@ -1,12 +1,12 @@
 from __future__ import annotations
 import os
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 try:
-    from .agentGraph import run_agent
+    from .agentGraph import run_agent, run_agent_email
 except ImportError:
-    from agentGraph import run_agent
+    from agentGraph import run_agent, run_agent_email
 
 # --- replaced LangChain wrappers with direct Ollama client ---
 try:
@@ -21,6 +21,7 @@ class RecruiterAgent:
         self.temperature = temperature  # retained for future tuning (ollama ignores for now)
         self.client = self._init_client()
         self.chat_top_k = int(os.getenv("CHAT_TOP_K", "3"))  # reduce LLM calls for chat
+        self.default_top_k = int(os.getenv("DEFAULT_TOP_K", str(self.chat_top_k)))
 
     def _init_client(self):
         if Client is None:
@@ -57,6 +58,15 @@ class RecruiterAgent:
         if any(t in msg_l for t in search_triggers) and (any(r in msg_l for r in role_terms) or " with " in msg_l or " and " in msg_l):
             return "search_candidates"
 
+        # --- new: email intent ---
+        email_triggers = [
+            "send emails", "send email", "email the candidates", "email candidates",
+            "invite", "send invites", "schedule interviews", "interview emails",
+            "send them interview", "send interview", "invite them"
+        ]
+        if any(phrase in msg_l for phrase in email_triggers):
+            return "email_candidates"
+
         # LLM fallback classification (kept brief and strict)
         prompt = f"""
 Return only one label on a single line:
@@ -77,43 +87,55 @@ Label:
             return "greeting"
         return "unknown"
 
-    # --- new: infer desired top_k from natural language message ---
-    def _infer_top_k(self, text: str, default: int | None = None) -> int:
+    # --- improved: infer desired top_k from natural language message ---
+    def _infer_top_k(self, text: str, default: Optional[int] = None) -> int:
         t = (text or "").lower()
         default_k = default if default is not None else self.chat_top_k
 
-        # Direct patterns: "top 3", "best 2", "top-5"
-        m = re.search(r"(top|best)\s*[- ]?\s*(\d+)", t)
-        if m:
-            try:
-                k = int(m.group(2))
-                return min(max(k, 1), 10)
-            except Exception:
-                pass
+        # Ignore numbers tied to years/months (e.g., "3 years", "2+ years")
+        t_wo_years = re.sub(r"\b\d+\s*\+?\s*(years?|yrs?|months?)\b", "", t)
 
-        # "best candidate" or "the best candidate"
-        if "best candidate" in t or ("best" in t and "candidate" in t and re.search(r"\b(best)\b.*\bcandidate(s)?\b", t)):
-            return 1
+        # Strong explicit patterns
+        patterns = [
+            r"top\s+(\d+)",
+            r"top\s+(\d+)\s+(?:candidate|candidates|profiles)",
+            r"(?:send|email|retrieve|get|show)\s+(?:the\s+)?(?:top\s+)?(\d+)\s+(?:candidate|candidates|profiles)",
+            r"(\d+)\s+(?:best|top)\s+(?:candidate|candidates|profiles)",
+            r"(?:candidate|candidates|profiles)\s*:\s*(\d+)",
+        ]
+        for pat in patterns:
+            m = re.search(pat, t_wo_years)
+            if m:
+                try:
+                    k = int(m.group(1))
+                    return min(max(k, 1), 50)
+                except Exception:
+                    pass
 
-        # Generic number in context of candidates
-        m2 = re.search(r"\b(\d+)\s+(candidates|people|profiles|engineers|developers|scientists)\b", t)
-        if m2:
-            try:
-                k = int(m2.group(1))
-                return min(max(k, 1), 10)
-            except Exception:
-                pass
-
-        # Number words
-        words = {
+        # Word numbers near candidate keywords
+        number_words = {
             "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
             "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
             "couple": 2, "few": 3, "single": 1
         }
-        for w, val in words.items():
-            if re.search(rf"\b{w}\b\s+(candidate|candidates)", t) or re.search(rf"(top|best)\s+{w}", t):
-                return min(max(val, 1), 10)
+        for w, val in number_words.items():
+            if re.search(rf"\b{w}\b\s+(?:candidate|candidates|profiles)\b", t_wo_years) or re.search(rf"\b(top|best)\s+{w}\b", t_wo_years):
+                return min(max(val, 1), 50)
 
+        # Generic "[number] candidates"
+        m2 = re.search(r"\b(\d+)\s+(?:candidate|candidates|profiles)\b", t_wo_years)
+        if m2:
+            try:
+                k = int(m2.group(1))
+                return min(max(k, 1), 50)
+            except Exception:
+                pass
+
+        # "best candidate" implies 1
+        if re.search(r"\bbest\s+candidate\b", t_wo_years):
+            return 1
+
+        # fallback
         return default_k
 
     # Public helper if API needs it
@@ -135,7 +157,7 @@ Label:
             lines.append(f"{i}. {cid}: {expl}")
         return "\n".join(lines)
 
-    def handle_message(self, message: str) -> str:
+    def handle_message(self, message: str, forced_top_k: Optional[int] = None) -> str:
         msg = (message or "").strip()
         if not msg:
             return "Hi, I'm your AI recruiter. What role or skills are you looking for?"
@@ -143,7 +165,7 @@ Label:
         intent = self._detect_intent(msg)
 
         if intent == "search_candidates":
-            k = self._infer_top_k(msg, self.chat_top_k)
+            k = forced_top_k or self._infer_top_k(msg, self.chat_top_k)
             try:
                 results = run_agent(job_desc=msg, top_k=k, with_explain=True)
             except TypeError:
@@ -152,6 +174,10 @@ Label:
                 except TypeError:
                     results = run_agent(msg)
             return self._format_candidates(results)
+
+        # --- new: reuse last saved state and only send emails ---
+        if intent == "email_candidates":
+            return run_agent_email()
 
         if intent == "greeting":
             return "Hi, I'm your AI recruiter. How can I help you today?"
@@ -175,3 +201,47 @@ Label:
             except TypeError:
                 results = run_agent(jd)
         return self._format_candidates(results)
+
+# Helper exposed for API to parse requested top_k directly
+def parse_requested_top_k(text: str) -> Optional[int]:
+    if not text:
+        return None
+    t = text.lower()
+    t = re.sub(r"\b\d+\s*\+?\s*(years?|yrs?|months?)\b", "", t)
+    # Try explicit patterns
+    patterns = [
+        r"top\s+(\d+)",
+        r"top\s+(\d+)\s+(?:candidate|candidates|profiles)",
+        r"(?:send|email|retrieve|get|show)\s+(?:the\s+)?(?:top\s+)?(\d+)\s+(?:candidate|candidates|profiles)",
+        r"(\d+)\s+(?:best|top)\s+(?:candidate|candidates|profiles)",
+        r"(?:candidate|candidates|profiles)\s*:\s*(\d+)",
+    ]
+    for pat in patterns:
+        m = re.search(pat, t)
+        if m:
+            try:
+                k = int(m.group(1))
+                return min(max(k, 1), 50)
+            except Exception:
+                pass
+    # Word numbers
+    number_words = {
+        "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+        "couple": 2, "few": 3, "single": 1
+    }
+    for w, val in number_words.items():
+        if re.search(rf"\b{w}\b\s+(?:candidate|candidates|profiles)\b", t) or re.search(rf"\b(top|best)\s+{w}\b", t):
+            return min(max(val, 1), 50)
+    # Generic
+    m2 = re.search(r"\b(\d+)\s+(?:candidate|candidates|profiles)\b", t)
+    if m2:
+        try:
+            k = int(m2.group(1))
+            return min(max(k, 1), 50)
+        except Exception:
+            pass
+    # "best candidate"
+    if re.search(r"\bbest\s+candidate\b", t):
+        return 1
+    return None

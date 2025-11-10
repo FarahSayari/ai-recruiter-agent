@@ -1,5 +1,7 @@
 from typing import Dict, Any, List
 import numpy as np
+import re
+import os
 
 # Robust import across langgraph versions
 try:
@@ -13,6 +15,22 @@ except ImportError:
         END = None
 
 from storage import CVStorage
+
+# Attempt to import real email sender utilities
+try:
+    from mailer import send_email, render_invite_subject, render_invite_body
+except Exception:
+    try:
+        from .mailer import send_email, render_invite_subject, render_invite_body  # type: ignore
+    except Exception:
+        send_email = None  # fallback to simulation if mailer unavailable
+        def render_invite_subject(role: str | None = None) -> str:
+            return "Interview Invitation"
+        def render_invite_body(candidate_name: str | None, job_desc_snippet: str, reply_to: str | None = None) -> str:
+            return (
+                f"Hello {candidate_name or 'Candidate'},\n\nWe'd like to invite you to an interview.\n\n"
+                f"Role details: {job_desc_snippet[:500]}\n\nBest regards,\nRecruitment Team"
+            )
 
 # Try imports from agentNodes; provide safe fallbacks
 try:
@@ -134,7 +152,7 @@ def _prepare_cvs(hits, job_vec):
     cvs = []
     for h in hits:
         payload = h.payload or {}
-        text = payload.get("resume_text") or ""
+        text = payload.get("resume_text") or ""  # SHOULD be original or contain email
         vec_raw = _extract_vector_from_point(h)
         if vec_raw is None and text:
             try:
@@ -143,31 +161,61 @@ def _prepare_cvs(hits, job_vec):
                 print("[prepare_cvs] embed resume error:", e)
                 vec_raw = None
         vec = _sanitize_vec(vec_raw) if vec_raw is not None else None
-        if vec is None:
-            print("[prepare_cvs] drop (vec None) id:", h.id)
+        if vec is None or vec.shape[0] != job_vec.shape[0]:
+            print("[prepare_cvs] drop id:", h.id)
             continue
-        if vec.shape[0] != job_vec.shape[0]:
-            print("[prepare_cvs] drop (dim mismatch) id:", h.id, "vec_dim:", getattr(vec, "shape", None))
-            continue
-        cvs.append({"candidate_id": payload.get("candidate_id", h.id), "resume_text": text, "vector": vec})
+        # Prefer stored email in payload; fallback to extracting from raw text
+        email = _email_from_payload(payload) or _extract_email(text)
+        cvs.append({
+            "candidate_id": payload.get("candidate_id", h.id),
+            "resume_text": text,
+            "vector": vec,
+            "email": email,  # may be None if truly absent
+        })
     print("[prepare_cvs] kept cvs:", len(cvs))
     return cvs
 
-# ---------------- Graph nodes (retrieve -> analyze -> rank -> explain) ----------------
+def _normalize_whitespace(t: str) -> str:
+    return re.sub(r"\s+", " ", t or "").strip()
 
-def retrieve_node(state: Dict[str, Any]) -> Dict[str, Any]:
-    job_desc_clean, job_vec = _embed_job_desc(state.get("job_desc", ""))
-    top_k = int(state.get("top_k", 5))
-    print("[retrieve] job_vec shape:", getattr(job_vec, "shape", None))
-    hits = _vector_search(job_vec, top_k)
-    cvs = _prepare_cvs(hits, job_vec)
-    return {
-        "job_desc_clean": job_desc_clean,
-        "job_embedding": job_vec,
-        "cvs": cvs,
-        "top_k": top_k,
-        "with_explain": state.get("with_explain", False),
-    }
+EMAIL_FALLBACK_DOMAIN = os.getenv("EMAIL_FALLBACK_DOMAIN", "example.com")
+
+# --- email extraction (real emails only; no synthetic fabrication) ---
+EMAIL_FIELD_NAMES = ("email", "Email", "candidate_email", "contact_email")
+
+def _extract_email(text: str) -> str | None:
+    """
+    Extract first raw email from ORIGINAL resume text.
+    NOTE: If preprocessing removed emails, you must store the original email
+    in Qdrant payload during ingestion (e.g. storage.add_cv_embeddings) under
+    a key listed in EMAIL_FIELD_NAMES so we can retrieve it here.
+    """
+    if not text:
+        return None
+    # Straight regex only (no obfuscation normalization to avoid false positives)
+    m = re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", text)
+    return m.group(0).strip() if m else None
+
+def _email_from_payload(payload: Dict[str, Any]) -> str | None:
+    if not payload:
+        return None
+    for k in EMAIL_FIELD_NAMES:
+        val = payload.get(k)
+        if isinstance(val, str) and "@" in val:
+            return val.strip()
+    return None
+
+def _candidate_name_from_text(text: str) -> str | None:
+    if not text:
+        return None
+    # heuristic: first two capitalized words at start
+    lines = text.strip().splitlines()
+    for line in lines[:5]:
+        tokens = [t for t in re.split(r"[\s,]+", line) if t]
+        caps = [t for t in tokens if re.match(r"^[A-Z][a-zA-Z\-]+$", t)]
+        if 1 <= len(caps) <= 3:
+            return " ".join(caps[:2])
+    return None
 
 def analyze_node(state: Dict[str, Any]) -> Dict[str, Any]:
     cvs = state.get("cvs", [])
@@ -224,74 +272,149 @@ def explain_node(state: Dict[str, Any]) -> Dict[str, Any]:
         info = analyzed.get(cid, {"full_text": cv.get("resume_text", "")})
         if "full_text" not in info:
             info["full_text"] = cv.get("resume_text", "")
-        # Merge skills (prefer analyzed; fallback to skill_map)
         skills = info.get("skills") or skill_map.get(cid, [])
         try:
             explanation = explain_rankingLLM(info, job_desc)
         except Exception as e:
             explanation = f"LLM error: {e}"
+        # Only real email (payload or raw text). No synthetic fallback.
+        email = cv.get("email")
+        if not email:
+            email = _extract_email(info.get("full_text", ""))  # attempt once
         results.append({
             "candidate_id": cid,
             "score": cv["score"],
             "skills": skills,
             "experience": info.get("experience"),
             "explanation": explanation,
+            "email": email,  # None if not found
         })
     new_state = dict(state)
     new_state["results"] = results
     return new_state
 
-# ---------------- Non-graph simple runner (debug/fallback) ----------------
+# ---------------- New: email sender node and persistence helpers ----------------
+_last_state: Dict[str, Any] | None = None  # module-level fallback cache
 
-def run_agent_simple(job_desc: str, top_k: int = 5, with_explain: bool = False) -> List[Dict[str, Any]]:
-    job_desc_clean, job_vec = _embed_job_desc(job_desc)
-    hits = _vector_search(job_vec, top_k)
-    cvs = _prepare_cvs(hits, job_vec)
-    if not cvs:
-        return []
-    from sklearn.metrics.pairwise import cosine_similarity
-    scores = []
-    for cv in cvs:
-        s = float(cosine_similarity(cv["vector"].reshape(1, -1), job_vec.reshape(1, -1))[0][0])
-        scores.append({**cv, "score": s})
-    scores.sort(key=lambda x: x["score"], reverse=True)
-    top = scores[:top_k]
-    results = []
-    for cv in top:
-        info = analyze_cv(cv["resume_text"])
-        if not info.get("skills"):
-            info["skills"] = _extract_skills_from_text(cv["resume_text"])
-        expl = ""
-        if with_explain:
+
+def email_sender_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Send (or simulate) interview invitation emails to top candidates.
+
+    Uses real SMTP via mailer.send_email when available; respects EMAIL_DRY_RUN.
+    Falls back to prior behavior (logging only) if mailer not importable.
+    """
+    results = state.get("results") or []
+    ranked = state.get("ranked") or []
+    top_k = int(state.get("top_k", 5))
+    job_desc_clean = state.get("job_desc_clean", state.get("job_desc", ""))
+
+    if not results and ranked:
+        # Build lightweight surrogate list
+        results = []
+        for cv in ranked[:top_k]:
+            email_guess = cv.get("email") or _extract_email(cv.get("resume_text", ""))
+            results.append({
+                "candidate_id": cv.get("candidate_id"),
+                "score": cv.get("score", 0.0),
+                "explanation": cv.get("explanation", ""),
+                "email": email_guess,
+                "resume_text": cv.get("resume_text", ""),
+            })
+
+    if not results:
+        summary = "No candidate list available to email. Run a search first."
+        print("[email_sender_node]", summary)
+        return {"email_summary": summary, "emailed": [], "emailed_entries": []}
+
+    emailed_ids: List[Any] = []
+    emailed_entries: List[Dict[str, Any]] = []
+    by_id = {cv.get("candidate_id"): cv for cv in ranked} if ranked else {}
+    subject = render_invite_subject(None)
+    reply_to = os.getenv("REPLY_TO") or os.getenv("FROM_EMAIL") or os.getenv("SMTP_USER")
+
+    for r in results[:top_k]:
+        cid = r.get("candidate_id")
+        if cid is None:
+            continue
+        email = r.get("email")
+        if not email and cid in by_id:
+            email = by_id[cid].get("email")
+        if not email:
+            analyzed = state.get("analyzed", {})
+            info = analyzed.get(cid, {})
+            email = _extract_email(info.get("full_text", "")) or _extract_email(r.get("explanation", ""))
+        if not email:
             try:
-                expl = explain_rankingLLM(info, job_desc_clean)
+                email = cv_storage.get_email_by_candidate_id(cid)
+            except Exception:
+                email = None
+
+        # Prepare body & attempt send (or skip if mailer missing / no email)
+        if email and send_email is not None:
+            name_source = r.get("resume_text") or by_id.get(cid, {}).get("resume_text", "")
+            name = _candidate_name_from_text(name_source)
+            body = render_invite_body(name, job_desc_clean, reply_to)
+            try:
+                ok = send_email(email, subject, body, reply_to=reply_to)
             except Exception as e:
-                expl = f"LLM error: {e}"
-        results.append({
-            "candidate_id": cv["candidate_id"],
-            "score": cv["score"],
-            "skills": info.get("skills", []),
-            "experience": info.get("experience"),
-            "explanation": expl,
-        })
-    return results
+                print(f"[email_sender_node] send error {cid} <{email}>: {e}")
+                ok = False
+            status = "sent" if ok else "failed"
+        else:
+            status = "skipped" if email else "no_email"
+
+        if not email:
+            email = "unknown"
+        print(f"Email {status} to {cid} <{email}>")
+        emailed_ids.append(cid)
+        emailed_entries.append({"candidate_id": cid, "email": email, "status": status})
+
+    summary = f"Attempted interview invitations to {len(emailed_ids)} candidates."
+    return {"email_summary": summary, "emailed": emailed_ids, "emailed_entries": emailed_entries}
+
+def _save_last_state(state: Dict[str, Any]):
+    global _last_state
+    _last_state = state
+    if _compiled_graph is not None and hasattr(_compiled_graph, "save_state"):
+        try:
+            _compiled_graph.save_state("last_run", state)
+            print("[state] saved via graph.save_state('last_run')")
+        except Exception as e:
+            print("[state] graph.save_state failed:", e)
+    else:
+        print("[state] saved in _last_state (no graph persistence available)")
+
+
+def _load_last_state() -> Dict[str, Any] | None:
+    if _compiled_graph is not None and hasattr(_compiled_graph, "load_state"):
+        try:
+            st = _compiled_graph.load_state("last_run")
+            if isinstance(st, dict):
+                print("[state] loaded via graph.load_state('last_run')")
+                return st
+        except Exception as e:
+            print("[state] graph.load_state failed:", e)
+    return _last_state
+
 
 # ---------------- Build/compile graph; single robust run_agent ----------------
-
 def build_agent_graph():
     if StateGraph is None or END is None:
         raise RuntimeError("LangGraph not available; use run_agent_simple instead.")
     graph = StateGraph(dict)
     graph.add_node("retrieve", retrieve_node)
     graph.add_node("analyze", analyze_node)
-    graph.add_node("skillExtractor", skill_extractor_node)  # new node
+    graph.add_node("skillExtractor", skill_extractor_node)
     graph.add_node("rank", rank_node)
     graph.add_node("explain", explain_node)
+    # New node registered (not on default path to avoid auto emails)
+    graph.add_node("emailSender", email_sender_node)
     graph.add_edge("retrieve", "analyze")
-    graph.add_edge("analyze", "skillExtractor")          # new edge
-    graph.add_edge("skillExtractor", "rank")             # new edge
+    graph.add_edge("analyze", "skillExtractor")
+    graph.add_edge("skillExtractor", "rank")
     graph.add_edge("rank", "explain")
     graph.add_edge("explain", END)
+    # (emailSender is intentionally not linked; invoked separately when needed)
     graph.set_entry_point("retrieve")
     return graph.compile()
 
@@ -311,8 +434,8 @@ def run_agent(job_desc: str, top_k: int = 5, with_explain: bool = False) -> List
 
     res = out.get("results")
     if res:
+        _save_last_state(out)  # persist full state with emails if present
         return res
-
     # Fallback: build from ranked if present
     ranked = out.get("ranked", [])
     analyzed = out.get("analyzed", {})
@@ -327,15 +450,75 @@ def run_agent(job_desc: str, top_k: int = 5, with_explain: bool = False) -> List
                 explanation = explain_rankingLLM(info, job_desc_clean)
             except Exception as e:
                 explanation = f"LLM error: {e}"
+            email = cv.get("email")
+            if not email:
+                email = _extract_email(info.get("full_text", "")) or _extract_email(explanation)
             results.append({
                 "candidate_id": cv["candidate_id"],
                 "score": cv["score"],
                 "skills": info.get("skills", []),
                 "experience": info.get("experience"),
                 "explanation": explanation,
+                "email": email,
             })
+        # persist reconstructed state with emails
+        new_state = dict(out)
+        new_state["results"] = results
+        _save_last_state(new_state)
         print(f"[run_agent] fallback built results from ranked: {len(results)}")
         return results
 
     print("[run_agent] graph returned no results; using simple fallback")
     return run_agent_simple(job_desc, top_k=top_k, with_explain=False)
+
+# Optionally persist simple path too (when graph unavailable)
+def run_agent_simple(job_desc: str, top_k: int = 5, with_explain: bool = False) -> List[Dict[str, Any]]:
+    """
+    Simple agent run without graph; for fallback or direct use.
+    """
+    job_desc_clean, job_vec = _embed_job_desc(job_desc)
+    top_k = min(max(top_k, 1), 100)
+    hits = _vector_search(job_vec, top_k)
+    cvs = _prepare_cvs(hits, job_vec)
+    results = []
+    for cv in cvs:
+        info = analyze_cv(cv["resume_text"])
+        try:
+            explanation = explain_rankingLLM(info, job_desc_clean)
+        except Exception as e:
+            explanation = f"LLM error: {e}"
+        email = cv.get("email")
+        if not email:
+            email = _extract_email(cv.get("resume_text", "")) or _extract_email(explanation)
+        results.append({
+            "candidate_id": cv["candidate_id"],
+            "score": cv.get("score", 0.0),
+            "skills": info.get("skills", []),
+            "experience": info.get("experience"),
+            "explanation": explanation,
+            "email": email,
+        })
+    _save_last_state({"results": results, "top_k": top_k, "job_desc_clean": job_desc_clean})
+    return results
+
+def run_agent_email() -> str:
+    """
+    Reuse previously saved state and send interview emails to top candidates,
+    returning a detailed reply that includes recipient emails.
+    """
+    state = _load_last_state()
+    if not state:
+        return "No previous candidate list found. Run a search first."
+    email_out = email_sender_node(state)
+    # Update persisted state with email summary/details
+    merged_state = dict(state)
+    merged_state.update(email_out)
+    _save_last_state(merged_state)
+    # --- new: build a detailed human-readable reply with emails ---
+    entries = email_out.get("emailed_entries", [])
+    if not entries:
+        return email_out.get("email_summary", "Done.")
+    lines = [email_out.get("email_summary", "Done.")]
+    for e in entries:
+        lines.append(f"- {e.get('candidate_id')} <{e.get('email')}>")
+    return "\n".join(lines)

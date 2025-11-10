@@ -49,10 +49,19 @@ class CVStorage:
             if emb.shape[0] != 768:
                 raise ValueError(f"Embedding at index {idx} has wrong shape: {emb.shape}")
     
+           # Pull optional email if present
+            email_val = None
+            if "email" in df.columns:
+                raw_email = df.loc[df.index[idx], "email"]
+                if isinstance(raw_email, str) and "@" in raw_email:
+                    email_val = raw_email.strip()
+    
             metadata = {
                 "candidate_id": int(df.index[idx]),
-                "resume_text": df.loc[df.index[idx], "Resume_clean"]
+                "resume_text": df.loc[df.index[idx], "Resume_clean"],
             }
+            if email_val:
+                metadata["email"] = email_val  # store for quick retrieval
     
             # Add point as dict (recommended for latest qdrant-client)
             points.append({
@@ -65,7 +74,7 @@ class CVStorage:
         self.client.upsert(collection_name=self.collection_name, points=points)
         print(f"Stored {len(points)} CV embeddings in collection '{self.collection_name}'.")
 
-    def add_single_cv(self, candidate_id: str, resume_text: str, embedding, skills: list[str] | None = None):
+    def add_single_cv(self, candidate_id: str, resume_text: str, embedding, skills: list[str] | None = None, email: str | None = None):
         from qdrant_client.http import models as qm
         vec = embedding.tolist() if hasattr(embedding, "tolist") else embedding
         payload = {
@@ -74,6 +83,8 @@ class CVStorage:
         }
         if skills:
             payload["skills"] = skills
+        if isinstance(email, str) and "@" in email:
+            payload["email"] = email.strip()
         self.client.upsert(
             collection_name=self.collection_name,
             points=[
@@ -84,3 +95,27 @@ class CVStorage:
                 )
             ],
         )
+
+    def get_email_by_candidate_id(self, candidate_id) -> str | None:
+        """Retrieve candidate email from Qdrant payload by point ID.
+
+        Returns None if not found or on error.
+        """
+        try:
+            cid = int(candidate_id)
+        except Exception:
+            return None
+        try:
+            pts = self.client.retrieve(
+                collection_name=self.collection_name,
+                ids=[cid],
+                with_payload=True
+            )
+            for p in pts:
+                payload = getattr(p, "payload", {}) or {}
+                email = payload.get("email")
+                if isinstance(email, str) and "@" in email:
+                    return email
+            return None
+        except Exception:
+            return None
