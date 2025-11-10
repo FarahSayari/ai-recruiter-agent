@@ -10,7 +10,7 @@ from .storage import CVStorage
 from qdrant_client import QdrantClient
 try:
     # Relative import since we are inside the src package
-    from .agentGraph import run_agent, get_bert_embeddings, run_agent_email
+    from .agentGraph import run_agent, get_bert_embeddings, run_agent_email, run_agent_schedule
 except ImportError:
     # Fallback: add this directory to path then plain import
     import sys
@@ -261,4 +261,15 @@ def send_emails(req: EmailRequest):
         }
     except Exception as e:
         logging.exception("Send emails error")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/schedule_interviews")
+def schedule_interviews():
+    """Generate calendar appointments for last results and email candidates with details."""
+    try:
+        summary = run_agent_schedule()
+        return {"summary": summary}
+    except Exception as e:
+        logging.exception("Schedule interviews error")
         raise HTTPException(status_code=500, detail=str(e))

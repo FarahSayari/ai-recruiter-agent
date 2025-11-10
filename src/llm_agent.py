@@ -4,9 +4,9 @@ import re
 from typing import Any, Dict, List, Optional
 
 try:
-    from .agentGraph import run_agent, run_agent_email
+    from .agentGraph import run_agent, run_agent_email, run_agent_schedule
 except ImportError:
-    from agentGraph import run_agent, run_agent_email
+    from agentGraph import run_agent, run_agent_email, run_agent_schedule
 
 # --- replaced LangChain wrappers with direct Ollama client ---
 try:
@@ -58,7 +58,17 @@ class RecruiterAgent:
         if any(t in msg_l for t in search_triggers) and (any(r in msg_l for r in role_terms) or " with " in msg_l or " and " in msg_l):
             return "search_candidates"
 
-        # --- new: email intent ---
+        # --- new: scheduling intent (calendar + email) ---
+        schedule_triggers = [
+            "schedule interviews", "schedule interview", "schedule them", "schedule for them",
+            "book meetings", "book meeting", "book interviews", "book interview",
+            "calendar these", "set up meetings", "set appointments", "schedule appointments",
+            "schedule with top candidates", "schedule for selected candidates",
+        ]
+        if any(phrase in msg_l for phrase in schedule_triggers):
+            return "schedule_interviews"
+
+        # --- email intent ---
         email_triggers = [
             "send emails", "send email", "email the candidates", "email candidates",
             "invite", "send invites", "schedule interviews", "interview emails",
@@ -175,7 +185,11 @@ Label:
                     results = run_agent(msg)
             return self._format_candidates(results)
 
-        # --- new: reuse last saved state and only send emails ---
+        # --- new: calendar + email flow ---
+        if intent == "schedule_interviews":
+            return run_agent_schedule()
+
+        # --- reuse last saved state and only send emails ---
         if intent == "email_candidates":
             return run_agent_email()
 

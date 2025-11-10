@@ -2,6 +2,7 @@ from typing import Dict, Any, List
 import numpy as np
 import re
 import os
+from datetime import datetime, timedelta
 
 # Robust import across langgraph versions
 try:
@@ -295,6 +296,7 @@ def explain_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 # ---------------- New: email sender node and persistence helpers ----------------
 _last_state: Dict[str, Any] | None = None  # module-level fallback cache
+_last_state_with_calendar: Dict[str, Any] | None = None
 
 
 def email_sender_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -331,6 +333,7 @@ def email_sender_node(state: Dict[str, Any]) -> Dict[str, Any]:
     by_id = {cv.get("candidate_id"): cv for cv in ranked} if ranked else {}
     subject = render_invite_subject(None)
     reply_to = os.getenv("REPLY_TO") or os.getenv("FROM_EMAIL") or os.getenv("SMTP_USER")
+    appointments = state.get("appointments", {})  # candidate_id -> {date,time,meeting_link}
 
     for r in results[:top_k]:
         cid = r.get("candidate_id")
@@ -354,6 +357,13 @@ def email_sender_node(state: Dict[str, Any]) -> Dict[str, Any]:
             name_source = r.get("resume_text") or by_id.get(cid, {}).get("resume_text", "")
             name = _candidate_name_from_text(name_source)
             body = render_invite_body(name, job_desc_clean, reply_to)
+            appt = appointments.get(cid)
+            if isinstance(appt, dict):
+                date = appt.get("date")
+                time = appt.get("time")
+                link = appt.get("meeting_link")
+                if date and time and link:
+                    body += f"\n\nInterview scheduled on {date} at {time}. Join via {link}."
             try:
                 ok = send_email(email, subject, body, reply_to=reply_to)
             except Exception as e:
@@ -397,6 +407,21 @@ def _load_last_state() -> Dict[str, Any] | None:
     return _last_state
 
 
+def _save_named_state(name: str, state: Dict[str, Any]):
+    """Attempt to persist a named state using graph.save_state, else keep in memory."""
+    global _last_state_with_calendar
+    if name == "last_run_with_calendar":
+        _last_state_with_calendar = state
+    if _compiled_graph is not None and hasattr(_compiled_graph, "save_state"):
+        try:
+            _compiled_graph.save_state(name, state)
+            print(f"[state] saved via graph.save_state('{name}')")
+            return
+        except Exception as e:
+            print(f"[state] graph.save_state('{name}') failed:", e)
+    print(f"[state] saved in memory as {name} (no graph persistence available)")
+
+
 # ---------------- Build/compile graph; single robust run_agent ----------------
 def build_agent_graph():
     if StateGraph is None or END is None:
@@ -407,8 +432,9 @@ def build_agent_graph():
     graph.add_node("skillExtractor", skill_extractor_node)
     graph.add_node("rank", rank_node)
     graph.add_node("explain", explain_node)
-    # New node registered (not on default path to avoid auto emails)
+    # New nodes registered (not on default path to avoid auto emails)
     graph.add_node("emailSender", email_sender_node)
+    graph.add_node("calendar", calendar_node)
     graph.add_edge("retrieve", "analyze")
     graph.add_edge("analyze", "skillExtractor")
     graph.add_edge("skillExtractor", "rank")
@@ -522,3 +548,66 @@ def run_agent_email() -> str:
     for e in entries:
         lines.append(f"- {e.get('candidate_id')} <{e.get('email')}>")
     return "\n".join(lines)
+
+
+# ---------------- Calendar node: generate appointments for candidates ----------------
+def _next_business_day(start: datetime) -> datetime:
+    d = start
+    while d.weekday() >= 5:  # 5=Sat,6=Sun
+        d += timedelta(days=1)
+    return d
+
+
+def calendar_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Create unique interview appointments for each top candidate in state['results'].
+
+    Produces state['appointments'] mapping candidate_id -> {date,time,meeting_link}.
+    """
+    results = state.get("results") or []
+    if not results:
+        # Build from ranked if needed
+        ranked = state.get("ranked", [])
+        results = [{"candidate_id": c.get("candidate_id"), "resume_text": c.get("resume_text", "")} for c in ranked]
+
+    if not results:
+        print("[calendar_node] No candidates to schedule.")
+        new_state = dict(state)
+        new_state["appointments"] = {}
+        return new_state
+
+    # Start scheduling from next business day at 10:00, 30-minute slots
+    start = _next_business_day(datetime.now() + timedelta(days=1))
+    slot_time = start.replace(hour=10, minute=0, second=0, microsecond=0)
+    slot_delta = timedelta(minutes=30)
+
+    appointments: Dict[Any, Dict[str, str]] = {}
+    for i, r in enumerate(results):
+        cid = r.get("candidate_id")
+        if cid is None:
+            continue
+        t = slot_time + i * slot_delta
+        date_str = t.strftime("%Y-%m-%d")
+        time_str = t.strftime("%H:%M")
+        link = f"https://meet.company.com/{cid}"
+        appointments[cid] = {"date": date_str, "time": time_str, "meeting_link": link}
+
+    new_state = dict(state)
+    new_state["appointments"] = appointments
+    # Persist as named state
+    _save_named_state("last_run_with_calendar", new_state)
+    return new_state
+
+
+def run_agent_schedule() -> str:
+    """Load last state, generate calendar appointments, and send emails including details."""
+    state = _load_last_state()
+    if not state:
+        return "No previous candidate list found. Run a search first."
+    with_calendar = calendar_node(state)
+    email_out = email_sender_node(with_calendar)
+    merged = dict(with_calendar)
+    merged.update(email_out)
+    _save_named_state("last_run_with_calendar", merged)
+    entries = email_out.get("emailed_entries", [])
+    count = sum(1 for e in entries if e.get("status") == "sent") if entries else 0
+    return f"Interview invites with calendar links sent to {count} candidates."
