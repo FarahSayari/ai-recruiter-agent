@@ -6,6 +6,7 @@ from typing import List, Any, Dict
 import os
 import PyPDF2
 import logging
+import time
 from .storage import CVStorage
 from qdrant_client import QdrantClient
 try:
@@ -36,6 +37,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Simple timing middleware to surface backend processing time per request
+@app.middleware("http")
+async def timing_middleware(request, call_next):
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    dur_ms = (time.perf_counter() - t0) * 1000
+    try:
+        response.headers["X-Process-Time-ms"] = f"{dur_ms:.1f}"
+    except Exception:
+        pass
+    print(f"[TIMING] {request.method} {request.url.path} -> {dur_ms:.1f} ms")
+    return response
 
 class JobRequest(BaseModel):
     job_description: str

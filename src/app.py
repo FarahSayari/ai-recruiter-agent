@@ -1,26 +1,155 @@
-# app.py
 import streamlit as st
 import requests
+import os
+from io import BytesIO
 
-st.set_page_config(page_title="AI Recruiter Agent", page_icon="🤖", layout="centered")
+# Resolve API URL without relying on Streamlit secrets
+API_URL = os.getenv("API_URL", "http://127.0.0.1:8000/chat")
 
-st.title("🤖 AI Recruiter Agent")
-st.write("Enter a job description and let the AI match top candidates!")
+# --------------- Page config & Styles ---------------
+st.set_page_config(page_title="AI Recruiting Assistant", page_icon="🎯", layout="centered")
 
-job_desc = st.text_area("Job Description", height=200)
-if st.button("Run Agent"):
-    if job_desc.strip():
-        with st.spinner("Running AI agent..."):
-            payload = {"job_description": job_desc, "top_k": 5, "with_explain": True}
-            res = requests.post("http://localhost:8000/query", json=payload)
+CUSTOM_CSS = """
+<style>
+/* Center title */
+.center-title { text-align: center; margin-top: -1rem; }
 
-        if res.status_code == 200:
-            data = res.json()["results"]
-            for r in data:
-                with st.chat_message("assistant"):
-                    st.markdown(f"**🧾 Candidate ID:** {r['candidate_id']} | **Score:** {r['score']:.4f}")
-                    st.markdown(r.get("explanation", "_No explanation available._"))
+/* Chat container */
+.chat-container {
+  max-width: 820px;
+  margin: 0 auto;
+  border: 1px solid #e6e6e6;
+  border-radius: 12px;
+  padding: 12px 12px 0 12px;
+  height: 60vh;
+  overflow-y: auto;
+  background: #ffffff;
+}
+.msg { display: flex; margin: 8px 0; }
+.msg.user { justify-content: flex-end; }
+.msg.agent { justify-content: flex-start; }
+.bubble {
+  padding: 10px 14px;
+  border-radius: 14px;
+  max-width: 80%;
+  line-height: 1.4;
+  white-space: pre-wrap;
+}
+.bubble.user {
+  background: #f0f0f0;
+  color: #111;
+}
+.bubble.agent {
+  background: #e8f0fe; /* light blue */
+  color: #0b3d91;
+}
+.input-row {
+  max-width: 820px;
+  margin: 10px auto 0 auto;
+}
+</style>
+"""
+
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# --------------- Sidebar (optional settings) ---------------
+with st.sidebar:
+    st.markdown("### Settings")
+    api_base = st.text_input("API URL", value=API_URL, help="FastAPI /chat endpoint URL")
+    st.caption("Set API_URL env var to change default.")
+
+# --------------- Session State ---------------
+if "chat" not in st.session_state:
+    st.session_state.chat = [
+        {"role": "agent", "content": "Hi, I’m your AI Recruiting Assistant. How can I help you today?"}
+    ]
+
+def add_message(role: str, content: str):
+    st.session_state.chat.append({"role": role, "content": content})
+
+
+# --------------- Title ---------------
+st.markdown('<h1 class="center-title">🎯 AI Recruiting Assistant</h1>', unsafe_allow_html=True)
+
+# --------------- Chat Container ---------------
+chat_placeholder = st.container()
+with chat_placeholder:
+    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
+    for m in st.session_state.chat:
+        role = m.get("role")
+        cls = "user" if role == "user" else "agent"
+        content = m.get("content", "")
+        st.markdown(f'<div class="msg {cls}"><div class="bubble {cls}">{content}</div></div>', unsafe_allow_html=True)
+    st.markdown('</div>', unsafe_allow_html=True)
+
+# --------------- Input Area ---------------
+st.markdown('<div class="input-row">', unsafe_allow_html=True)
+col1, col2 = st.columns([4, 1])
+with col1:
+    user_text = st.text_input("Message", value="", placeholder="Type a message (e.g., Find top 3 data scientists with NLP) ...")
+with col2:
+    send_clicked = st.button("Send", type="primary", use_container_width=True)
+
+uploaded_file = st.file_uploader("Upload job description PDF (optional)", type=["pdf"], accept_multiple_files=False)
+st.markdown('</div>', unsafe_allow_html=True)
+
+
+def call_chat_api(message: str, file_bytes: bytes | None, filename: str | None) -> tuple[bool, str]:
+    """Return (ok, reply_text). Sends multipart if file present; else JSON."""
+    headers = {}
+
+    try:
+        if file_bytes is not None and filename:
+            files = {
+                "file": (filename, BytesIO(file_bytes), "application/pdf"),
+            }
+            data = {"message": message}
+            # Allow more time for PDF parsing + retrieval
+            resp = requests.post(api_base, files=files, data=data, headers=headers, timeout=240)
         else:
-            st.error(f"Error {res.status_code}: {res.text}")
+            payload = {"message": message}
+            # Allow more time for model/explanations on slower machines
+            resp = requests.post(api_base, json=payload, headers=headers, timeout=180)
+
+        if resp.status_code != 200:
+            return False, f"API error {resp.status_code}: {resp.text}" 
+        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+        reply = (data or {}).get("reply")
+        if not reply:
+            # Some endpoints might return plain text
+            reply = resp.text or "(no reply)"
+        return True, reply
+    except Exception as e:
+        return False, f"Request failed: {e}"
+
+
+# --------------- Handle submission ---------------
+if send_clicked:
+    msg = (user_text or "").strip()
+    if not msg and not uploaded_file:
+        st.warning("Please type a message or upload a PDF.")
     else:
-        st.warning("Please enter a job description first.")
+        if msg:
+            add_message("user", msg)
+        else:
+            add_message("user", "(PDF uploaded)")
+
+        file_bytes = uploaded_file.read() if uploaded_file else None
+        filename = uploaded_file.name if uploaded_file else None
+
+        with st.spinner("Thinking..."):
+            ok, reply = call_chat_api(msg, file_bytes, filename)
+
+        if ok:
+            add_message("agent", reply)
+        else:
+            add_message("agent", f"⚠️ {reply}")
+
+        # Rerun to refresh the chat container (compat across Streamlit versions)
+        try:
+            st.rerun()
+        except Exception:
+            try:
+                st.experimental_rerun()  # older versions
+            except Exception:
+                pass
