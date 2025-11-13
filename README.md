@@ -8,7 +8,7 @@ Automate sourcing, ranking, explaining, and contacting top candidates from a res
 
 ---
 
-## 🚀 Overview
+## Overview
 
 **Aura** is an end-to-end AI Recruiting Assistant designed to reduce manual screening time for HR teams.  
 It processes unstructured CVs (PDF, text, or images), cleans and embeds them, stores them in **Qdrant**, and uses a **RAG-driven multimodal agent** to:
@@ -53,7 +53,7 @@ Key files:
 
 ---
 
-## 4. Quick Start (Windows / PowerShell)
+## Quick Start (Windows / PowerShell)
 ```powershell
 # 1. Create & activate virtual environment
 python -m venv venv
@@ -73,7 +73,7 @@ Open UI at http://localhost:8501 and API at http://localhost:8000/docs (Swagger)
 
 ---
 
-## 5. Environment Variables
+## Environment Variables
 Set in PowerShell (session) before starting services:
 ```powershell
 # SMTP (Gmail example – use App Password)
@@ -88,7 +88,7 @@ $env:EMAIL_DRY_RUN = "1"                               # Set "0" to actually sen
 
 ---
 
-## 6. Usage Flow
+## Usage Flow
 1. Launch Streamlit & API.
 2. Paste or upload a PDF job description.
 3. Ask: “Find top 3 candidates for this JD.”
