@@ -26,17 +26,17 @@ Aura is an AI recruiting assistant that ingests / indexes cleaned resumes (CVs),
 You can add illustrative images in the `images/` folder. Suggested filenames:
 | Purpose | File |
 |---------|------|
-| Main UI (chat + input bar) | `images/aura_newChat.png` |
-| FAQ | `images/1113.png` |
-| Candidate list example | `images/1113(1).png` |
-| Qdrant DB | `images/qdrant.png` |
+| Main UI (chat + input bar) | `./images/aura_newChat.png` |
+| FAQ | `./images/1113.png` |
+| Candidate list example | `./images/1113(1).png` |
+| Qdrant DB | `./images/qdrant.png` |
 
 Embed them once added:
 ```markdown
-![Aura UI](images/aura_newChat.png)
-![Candidate List](images/1113.png)
-![Scheduling](images/1113(1).png)
-![Scheduling](images/qdrant.png)
+![Aura UI](./images/aura_newChat.png)
+![Candidate List](./images/1113.png)
+![Scheduling](./images/1113(1).png)
+![Scheduling](./images/qdrant.png)
 ```
 
 ## Architecture Diagram
