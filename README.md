@@ -32,11 +32,8 @@ You can add illustrative images in the `images/` folder. Suggested filenames:
 | Qdrant DB | `./images/qdrant.png` |
 
 Embed them once added:
-```markdown
 ![Aura UI](/images/aura_newChat.png)
-![Candidate List](./images/1113.png)
-![Scheduling](./images/1113(1).png)
-![Scheduling](./images/qdrant.png)
+
 ```
 
 ## Architecture Diagram
