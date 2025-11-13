@@ -40,11 +40,9 @@ Embed them once added:
 ```
 
 ## Architecture Diagram
-Place a visual diagram (e.g. exported from draw.io / mermaid) at `images/architecture.png`:
 ```markdown
 ![Architecture](images/architecture.png)
 ```
-This replaces or complements the ASCII diagram in section 3. Keep both for accessibility.
 
 
 
