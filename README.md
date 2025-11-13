@@ -1,29 +1,57 @@
-<div align="center">
-<h1>Aura – AI Recruiter Agent</h1>
-<p><strong>Source, rank, explain and contact top candidates from your own CV / resume datastore.</strong></p>
-<p>Streamlit UI · FastAPI backend · Qdrant vector search · BERT embeddings · Ollama LLM (optional) · SMTP scheduling & outreach</p>
-</div>
+# Aura – AI Recruiter Agent
+
+Automate sourcing, ranking, explaining, and contacting top candidates from a resume datastore using a multimodal AI agent powered by RAG, Qdrant, BERT embeddings, and LangGraph.
+
+<p align="center">
+  <img src="images/aura_newChat.png" width="750"/>
+</p>
 
 ---
 
-## 1. Overview
-Aura is an AI recruiting assistant that ingests / indexes cleaned resumes (CVs), then lets you:
-- Provide a job description (paste or PDF upload)
-- Retrieve and rank the top N matching candidates
-- Generate concise skill/experience/achievement rationales (2–3 sentences)
-- Schedule interview slots and send invitation emails
-- Ask built‑in FAQ questions (“Who are you?”, “What can you do?”, etc.)
+## 🚀 Overview
 
+**Aura** is an end-to-end AI Recruiting Assistant designed to reduce manual screening time for HR teams.  
+It processes unstructured CVs (PDF, text, or images), cleans and embeds them, stores them in **Qdrant**, and uses a **RAG-driven multimodal agent** to:
+
+- Parse, clean, and embed CVs into vector space  
+- Match candidates to any job description  
+- Retrieve & rank the **Top N** most relevant candidates  
+- Generate short, explainable rationales (2–3 sentences)  
+- Automate interview scheduling & email outreach  
+- Answer built-in FAQs about how it works  
+
+The agent is exposed through a **FastAPI endpoint** and consumed by a **Streamlit chat UI**.
 
 ---
 
-## 2. Features
-| Area | Capability |
-| Job Description | Text input or PDF upload (auto‑clean & embed) |
-| Email Outreach | SMTP invites with interview scheduling |
+## 🧠 Key Features
+
+### Candidate Intelligence  
+- Advanced text cleanup & preprocessing  
+- BERT embeddings stored in Qdrant  
+- RAG-based retrieval against job descriptions  
+- Relevance scoring & candidate ranking  
+
+### Multimodal Agent (LangGraph)  
+- Ranking node  
+- Explanation generator  
+- Intent detection (FAQ, scheduling, ranking, etc.)  
+- Email + scheduling nodes  
+
+### Automation and Communication  
+- SMTP email integration  
+- Configurable dry-run mode  
+- Compact system messages for clean UX  
+
+### Streamlit Chat App  
+- Modern ChatGPT-style UI  
+- File uploads (PDF JD or text)  
+- Real-time candidate list display  
+
+---
+
 
 ## Screenshots & Examples
-You can add illustrative images in the `images/` folder. Suggested filenames:
 | Purpose | File |
 |---------|------|
 | Main UI (chat + input bar) | ![Aura UI](/images/aura_newChat.png) |
@@ -32,34 +60,12 @@ You can add illustrative images in the `images/` folder. Suggested filenames:
 | Qdrant DB | ![Aura UI](/images/qdrant.png) |
 
 
-```
-
-## Architecture Diagram
-```markdown
-![Architecture](images/architecture.png)
-```
 
 
 
 ---
 
-## 3. Architecture
-```
-Streamlit (UI)  -->  FastAPI /chat
-					    |
-					    v
-				 RecruiterAgent (intent, formatting, FAQ)
-					    |
-				  Agent Graph (retrieve -> analyze -> skills -> rank -> explain)
-					    |
-				    Qdrant (vectors + payload email/name)
-					    |
-				   BERT Embeddings (transformers)
-					    |
-				    Ollama LLM (phi3 or configured) [optional]
-					    |
-					SMTP (invite emails)
-```
+
 Key files:
 - `src/app.py` – Streamlit interface
 - `src/api.py` – FastAPI endpoints (`/chat`)
@@ -95,16 +101,6 @@ Open UI at http://localhost:8501 and API at http://localhost:8000/docs (Swagger)
 ## 5. Environment Variables
 Set in PowerShell (session) before starting services:
 ```powershell
-$env:API_URL = "http://127.0.0.1:8000/chat"            # Frontend API base
-$env:OLLAMA_HOST = "http://localhost:11434"            # Ollama server
-$env:OLLAMA_MODEL = "phi3"                              # Or fast model (phi3:mini, llama3.2:1b-instruct)
-$env:CHAT_TOP_K = "3"                                   # Default results in chat
-$env:EXPLAIN_WITH_LLM = "1"                            # Set "0" to skip LLM explanations (fast mode)
-$env:RERANK_LOCALLY = "0"                               # Set "1" to fetch vectors & cosine rerank
-$env:LLM_NUM_PREDICT = "128"                            # Limit tokens for faster generation
-$env:MAX_RESUME_CHARS = "1200"                          # Prompt truncation
-$env:MAX_JOB_CHARS = "800"                              # Prompt truncation
-
 # SMTP (Gmail example – use App Password)
 $env:SMTP_HOST = "smtp.gmail.com"
 $env:SMTP_PORT = "587"
@@ -114,7 +110,6 @@ $env:FROM_EMAIL = "your_email@gmail.com"
 $env:REPLY_TO = "your_email@gmail.com"
 $env:EMAIL_DRY_RUN = "1"                               # Set "0" to actually send
 ```
-Persistent (across sessions) alternative: `setx VAR "value"` (then restart shell).
 
 ---
 
