@@ -22,31 +22,6 @@ It processes unstructured CVs (PDF, text, or images), cleans and embeds them, st
 
 The agent is exposed through a **FastAPI endpoint** and consumed by a **Streamlit chat UI**.
 
----
-
-## 🧠 Key Features
-
-### Candidate Intelligence  
-- Advanced text cleanup & preprocessing  
-- BERT embeddings stored in Qdrant  
-- RAG-based retrieval against job descriptions  
-- Relevance scoring & candidate ranking  
-
-### Multimodal Agent (LangGraph)  
-- Ranking node  
-- Explanation generator  
-- Intent detection (FAQ, scheduling, ranking, etc.)  
-- Email + scheduling nodes  
-
-### Automation and Communication  
-- SMTP email integration  
-- Configurable dry-run mode  
-- Compact system messages for clean UX  
-
-### Streamlit Chat App  
-- Modern ChatGPT-style UI  
-- File uploads (PDF JD or text)  
-- Real-time candidate list display  
 
 ---
 
