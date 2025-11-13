@@ -3,153 +3,244 @@ import requests
 import os
 from io import BytesIO
 
-# Resolve API URL without relying on Streamlit secrets
+# ----------------- Config -----------------
 API_URL = os.getenv("API_URL", "http://127.0.0.1:8000/chat")
+st.set_page_config(page_title="Aura – AI Recruiting Assistant", page_icon="🎯", layout="wide")
 
-# --------------- Page config & Styles ---------------
-st.set_page_config(page_title="AI Recruiting Assistant", page_icon="🎯", layout="centered")
-
-CUSTOM_CSS = """
+# ----------------- Custom CSS (Gradient Pink/Violet Style) -----------------
+st.markdown("""
 <style>
-/* Center title */
-.center-title { text-align: center; margin-top: -1rem; }
+body {
+    background-color: #ffffff;
+    font-family: 'Inter', 'Segoe UI', system-ui, sans-serif;
+}
+
+/* Remove Streamlit default padding */
+.main > div { padding-top: 1rem !important; padding-bottom: 0 !important; }
 
 /* Chat container */
 .chat-container {
-  max-width: 820px;
-  margin: 0 auto;
-  border: 1px solid #e6e6e6;
-  border-radius: 12px;
-  padding: 12px 12px 0 12px;
-  height: 60vh;
-  overflow-y: auto;
-  background: #ffffff;
+    max-width: 800px;
+    margin: 0 auto;
+    padding: 1rem 1rem 8rem 1rem;
+    overflow-y: auto;
 }
-.msg { display: flex; margin: 8px 0; }
-.msg.user { justify-content: flex-end; }
-.msg.agent { justify-content: flex-start; }
+
+/* Messages */
+.message {
+    display: flex;
+    align-items: flex-start;
+    margin-bottom: 1.1rem;
+}
+
+.message.user {
+    justify-content: flex-end;
+}
+
 .bubble {
-  padding: 10px 14px;
-  border-radius: 14px;
-  max-width: 80%;
-  line-height: 1.4;
-  white-space: pre-wrap;
+    border-radius: 12px;
+    padding: 0.8rem 1rem;
+    max-width: 80%;
+    line-height: 1.45;
+    font-size: 15px;
+    box-shadow: 0 1px 2px rgba(0,0,0,0.06);
+    white-space: pre-wrap;
 }
-.bubble.user {
-  background: #f0f0f0;
-  color: #111;
+
+/* Agent bubble (light gray) */
+.message.agent .bubble {
+    background-color: #f7f7f8;
+    color: #111827;
 }
-.bubble.agent {
-  background: #e8f0fe; /* light blue */
-  color: #0b3d91;
+
+/* User bubble (gradient pink → violet) */
+.message.user .bubble {
+    background: linear-gradient(135deg, #ec4899, #8b5cf6);
+    color: white;
 }
-.input-row {
-  max-width: 820px;
-  margin: 10px auto 0 auto;
+
+/* Header / Aura intro */
+.header {
+    text-align: center;
+    margin-bottom: 2rem;
+}
+.header h1 {
+    font-size: 1.8rem;
+    font-weight: 700;
+    background: linear-gradient(135deg, #ec4899, #8b5cf6);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+}
+.header p {
+    color: #6b7280;
+    font-size: 0.95rem;
+}
+
+/* Input bar (fixed bottom like ChatGPT) */
+.input-bar {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    background: #ffffff;
+    border-top: 1px solid #e5e7eb;
+    padding: 0.8rem 0;
+}
+
+.input-container {
+    max-width: 800px;
+    margin: 0 auto;
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+/* Text input */
+.stTextInput>div>div>input {
+    border-radius: 24px !important;
+    border: 1px solid #d1d5db !important;
+    padding: 0.7rem 1rem !important;
+    font-size: 15px !important;
+}
+
+/* Gradient button */
+.stButton>button {
+    border-radius: 24px !important;
+    background: linear-gradient(135deg, #ec4899, #8b5cf6) !important;
+    color: white !important;
+    font-weight: 500;
+    padding: 0.6rem 1rem;
+    font-size: 15px;
+    border: none !important;
+    transition: all 0.2s ease-in-out;
+}
+
+.stButton>button:hover {
+    background: linear-gradient(135deg, #f472b6, #a78bfa) !important;
+    transform: scale(1.02);
+}
+
+/* Sidebar */
+section[data-testid="stSidebar"] {
+    background-color: #f9fafb;
+    border-right: 1px solid #e5e7eb;
 }
 </style>
-"""
+""", unsafe_allow_html=True)
 
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-
-# --------------- Sidebar (optional settings) ---------------
+# ----------------- Sidebar -----------------
 with st.sidebar:
-    st.markdown("### Settings")
-    api_base = st.text_input("API URL", value=API_URL, help="FastAPI /chat endpoint URL")
-    st.caption("Set API_URL env var to change default.")
+    st.title("Aura")
+    api_base = st.text_input("API URL", value=API_URL)
+    st.markdown("---")
+    if st.button("New Chat", use_container_width=True):
+        st.session_state["messages"] = [{"role": "agent", "content": "Ready when you are."}]
+        st.rerun()
 
-# --------------- Session State ---------------
-if "chat" not in st.session_state:
-    st.session_state.chat = [
-        {"role": "agent", "content": "Hi, I’m your AI Recruiting Assistant. How can I help you today?"}
-    ]
+# ----------------- Session State -----------------
+if "messages" not in st.session_state:
+    st.session_state.messages = [{"role": "agent", "content": "Ready when you are."}]
 
-def add_message(role: str, content: str):
-    st.session_state.chat.append({"role": role, "content": content})
+# Deferred clearing mechanism (avoid modifying widget key after instantiation in same run)
+if st.session_state.get("clear_input"):
+    # Perform clear BEFORE rendering widgets
+    st.session_state["user_input"] = ""
+    del st.session_state["clear_input"]
+    # Increment uploader version to force a fresh empty uploader widget
+    st.session_state["uploader_version"] = st.session_state.get("uploader_version", 0) + 1
 
+if "uploader_version" not in st.session_state:
+    st.session_state["uploader_version"] = 0
 
-# --------------- Title ---------------
-st.markdown('<h1 class="center-title">🎯 AI Recruiting Assistant</h1>', unsafe_allow_html=True)
+# ----------------- Helper -----------------
+def add_message(role, content):
+    st.session_state.messages.append({"role": role, "content": content})
 
-# --------------- Chat Container ---------------
-chat_placeholder = st.container()
-with chat_placeholder:
-    st.markdown('<div class="chat-container">', unsafe_allow_html=True)
-    for m in st.session_state.chat:
-        role = m.get("role")
-        cls = "user" if role == "user" else "agent"
-        content = m.get("content", "")
-        st.markdown(f'<div class="msg {cls}"><div class="bubble {cls}">{content}</div></div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-# --------------- Input Area ---------------
-st.markdown('<div class="input-row">', unsafe_allow_html=True)
-col1, col2 = st.columns([4, 1])
-with col1:
-    user_text = st.text_input("Message", value="", placeholder="Type a message (e.g., Find top 3 data scientists with NLP) ...")
-with col2:
-    send_clicked = st.button("Send", type="primary", use_container_width=True)
-
-uploaded_file = st.file_uploader("Upload job description PDF (optional)", type=["pdf"], accept_multiple_files=False)
-st.markdown('</div>', unsafe_allow_html=True)
-
-
-def call_chat_api(message: str, file_bytes: bytes | None, filename: str | None) -> tuple[bool, str]:
-    """Return (ok, reply_text). Sends multipart if file present; else JSON."""
-    headers = {}
-
+def call_chat_api(message, file_bytes=None, filename=None):
     try:
-        if file_bytes is not None and filename:
-            files = {
-                "file": (filename, BytesIO(file_bytes), "application/pdf"),
-            }
+        if file_bytes and filename:
+            files = {"file": (filename, BytesIO(file_bytes), "application/pdf")}
             data = {"message": message}
-            # Allow more time for PDF parsing + retrieval
-            resp = requests.post(api_base, files=files, data=data, headers=headers, timeout=240)
+            resp = requests.post(API_URL, files=files, data=data, timeout=240)
         else:
             payload = {"message": message}
-            # Allow more time for model/explanations on slower machines
-            resp = requests.post(api_base, json=payload, headers=headers, timeout=180)
+            resp = requests.post(API_URL, json=payload, timeout=180)
 
         if resp.status_code != 200:
-            return False, f"API error {resp.status_code}: {resp.text}" 
-        data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
-        reply = (data or {}).get("reply")
-        if not reply:
-            # Some endpoints might return plain text
-            reply = resp.text or "(no reply)"
-        return True, reply
+            return False, f"API error {resp.status_code}: {resp.text}"
+        data = resp.json()
+        return True, data.get("reply", resp.text)
     except Exception as e:
         return False, f"Request failed: {e}"
 
+# ----------------- Chat UI -----------------
+st.markdown('<div class="chat-container">', unsafe_allow_html=True)
 
-# --------------- Handle submission ---------------
+# Show Aura intro only before first user message
+if not any(m["role"] == "user" for m in st.session_state.messages):
+    st.markdown("""
+    <div class="header">
+        <h1>Aura</h1>
+        <p>Ready when you are.</p>
+    </div>
+    """, unsafe_allow_html=True)
+
+# Display chat messages
+for m in st.session_state.messages:
+    role = m["role"]
+    content = m["content"]
+    if role == "agent" and content.lower() == "ready when you are.":
+        continue
+    st.markdown(
+        f'<div class="message {role}"><div class="bubble">{content}</div></div>',
+        unsafe_allow_html=True
+    )
+
+# Smooth auto-scroll to bottom after messages
+st.markdown("""
+<script>
+var chatContainer = document.getElementsByClassName('chat-container')[0];
+if(chatContainer){
+    chatContainer.scrollTo({ top: chatContainer.scrollHeight, behavior: 'smooth' });
+}
+</script>
+""", unsafe_allow_html=True)
+
+st.markdown('</div>', unsafe_allow_html=True)
+
+# ----------------- Input Bar -----------------
+st.markdown('<div class="input-bar">', unsafe_allow_html=True)
+with st.container():
+    st.markdown('<div class="input-container">', unsafe_allow_html=True)
+    col1, col2 = st.columns([8, 1])
+    with col1:
+        # Initialize session key if absent, then use key-only pattern (no explicit value) to allow clearing safely
+        if "user_input" not in st.session_state:
+            st.session_state["user_input"] = ""
+        st.text_input("Message", placeholder="Message Aura...", label_visibility="collapsed", key="user_input")
+    with col2:
+        send_clicked = st.button("Send", use_container_width=True)
+    # Key for uploader allows resetting via st.session_state
+    uploader_key = f"job_pdf_{st.session_state['uploader_version']}"
+    uploaded_file = st.file_uploader("Upload job description PDF", type=["pdf"], label_visibility="collapsed", key=uploader_key)
+    st.markdown('</div>', unsafe_allow_html=True)
+st.markdown('</div>', unsafe_allow_html=True)
+
+# ----------------- Handle Send -----------------
 if send_clicked:
-    msg = (user_text or "").strip()
-    if not msg and not uploaded_file:
-        st.warning("Please type a message or upload a PDF.")
+    msg = (st.session_state.get("user_input", "") or "").strip()
+    file_obj = uploaded_file  # use direct variable, not session state
+    if not msg and not file_obj:
+        st.warning("Please type a message or upload a file.")
     else:
-        if msg:
-            add_message("user", msg)
-        else:
-            add_message("user", "(PDF uploaded)")
-
-        file_bytes = uploaded_file.read() if uploaded_file else None
-        filename = uploaded_file.name if uploaded_file else None
+        add_message("user", msg or "(PDF uploaded)")
+        file_bytes = file_obj.read() if file_obj else None
+        filename = file_obj.name if file_obj else None
 
         with st.spinner("Thinking..."):
             ok, reply = call_chat_api(msg, file_bytes, filename)
+        add_message("agent", reply if ok else f"⚠️ {reply}")
 
-        if ok:
-            add_message("agent", reply)
-        else:
-            add_message("agent", f"⚠️ {reply}")
-
-        # Rerun to refresh the chat container (compat across Streamlit versions)
-        try:
-            st.rerun()
-        except Exception:
-            try:
-                st.experimental_rerun()  # older versions
-            except Exception:
-                pass
+    # Flag for clearing on next run & trigger uploader reset
+    st.session_state["clear_input"] = True
+    st.rerun()

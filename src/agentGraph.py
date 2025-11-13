@@ -1,7 +1,10 @@
 from typing import Dict, Any, List
+import functools
 import numpy as np
 import re
 import os
+import json
+from pathlib import Path
 from datetime import datetime, timedelta
 
 # Robust import across langgraph versions
@@ -120,18 +123,21 @@ def _extract_skills_from_text(text: str) -> List[str]:
     found = sorted({kw for kw in SKILL_KEYWORDS if kw in tokens})
     return found
 
+@functools.lru_cache(maxsize=64)
 def _embed_job_desc(job_desc: str):
+    """Embed job description with simple LRU cache to avoid recomputation across repeated queries."""
     job_desc_clean = preprocess_text(job_desc or "")
     job_vec = _sanitize_vec(get_bert_embeddings([job_desc_clean])[0])
     return job_desc_clean, job_vec
 
 def _vector_search(job_vec, top_k: int):
+    rerank_locally = os.getenv("RERANK_LOCALLY", "0") == "1"
     try:
         hits = cv_storage.client.search(
             collection_name=cv_storage.collection_name,
             query_vector=job_vec.tolist(),
             limit=max(top_k, 10),
-            with_vectors=True,
+            with_vectors=rerank_locally,  # avoid shipping vectors when not reranking locally
             with_payload=True,
         )
     except Exception as e:
@@ -150,26 +156,32 @@ def _vector_search(job_vec, top_k: int):
     return hits
 
 def _prepare_cvs(hits, job_vec):
+    rerank_locally = os.getenv("RERANK_LOCALLY", "0") == "1"
     cvs = []
     for h in hits:
         payload = h.payload or {}
         text = payload.get("resume_text") or ""  # SHOULD be original or contain email
-        vec_raw = _extract_vector_from_point(h)
-        if vec_raw is None and text:
-            try:
-                vec_raw = get_bert_embeddings([text])[0]
-            except Exception as e:
-                print("[prepare_cvs] embed resume error:", e)
-                vec_raw = None
-        vec = _sanitize_vec(vec_raw) if vec_raw is not None else None
-        if vec is None or vec.shape[0] != job_vec.shape[0]:
-            print("[prepare_cvs] drop id:", h.id)
-            continue
+        score = getattr(h, "score", 0.0)
+        vec = None
+        if rerank_locally:
+            vec_raw = _extract_vector_from_point(h)
+            if vec_raw is None and text:
+                try:
+                    vec_raw = get_bert_embeddings([text])[0]
+                except Exception as e:
+                    print("[prepare_cvs] embed resume error:", e)
+                    vec_raw = None
+            vec = _sanitize_vec(vec_raw) if vec_raw is not None else None
+            if vec is None or vec.shape[0] != job_vec.shape[0]:
+                print("[prepare_cvs] drop id:", h.id)
+                continue
         # Prefer stored email in payload; fallback to extracting from raw text
         email = _email_from_payload(payload) or _extract_email(text)
         cvs.append({
+            "point_id": getattr(h, "id", None),
             "candidate_id": payload.get("candidate_id", h.id),
             "resume_text": text,
+            "score": float(score) if score is not None else 0.0,
             "vector": vec,
             "email": email,  # may be None if truly absent
         })
@@ -250,6 +262,14 @@ def skill_extractor_node(state: Dict[str, Any]) -> Dict[str, Any]:
 
 def rank_node(state: Dict[str, Any]) -> Dict[str, Any]:
     cvs = state.get("cvs", [])
+    rerank_locally = os.getenv("RERANK_LOCALLY", "0") == "1"
+    if not cvs:
+        return {**state, "ranked": []}
+    if not rerank_locally:
+        # Trust vector DB score; sort by existing score (already present from search)
+        ranked = sorted(cvs, key=lambda x: float(x.get("score", 0.0)), reverse=True)
+        return {**state, "ranked": ranked}
+    # Local rerank via cosine similarity
     job_emb = state.get("job_embedding")
     ids = [c["candidate_id"] for c in cvs]
     embs = [c["vector"] for c in cvs]
@@ -257,8 +277,19 @@ def rank_node(state: Dict[str, Any]) -> Dict[str, Any]:
     score_map = {cid: s for cid, s in ranking}
     ranked = [{**c, "score": float(score_map.get(c["candidate_id"], 0.0))} for c in cvs]
     ranked.sort(key=lambda x: x["score"], reverse=True)
+    return {**state, "ranked": ranked}
+
+def retrieve_node(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Initial retrieval: embed job description, search vector DB, prepare CVs."""
+    job_desc_raw = state.get("job_desc", "")
+    top_k = int(state.get("top_k", 5))
+    job_desc_clean, job_vec = _embed_job_desc(job_desc_raw)
+    hits = _vector_search(job_vec, top_k)
+    cvs = _prepare_cvs(hits, job_vec)
     new_state = dict(state)
-    new_state["ranked"] = ranked
+    new_state["job_desc_clean"] = job_desc_clean
+    new_state["job_embedding"] = job_vec
+    new_state["cvs"] = cvs
     return new_state
 
 def explain_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -282,8 +313,15 @@ def explain_node(state: Dict[str, Any]) -> Dict[str, Any]:
         email = cv.get("email")
         if not email:
             email = _extract_email(info.get("full_text", ""))  # attempt once
+        # NEW: extract a human-friendly name from text or explanation
+        name = None
+        try:
+            name = _candidate_name_from_text(info.get("full_text", "")) or _candidate_name_from_text(explanation)
+        except Exception:
+            name = None
         results.append({
             "candidate_id": cid,
+            "name": name,
             "score": cv["score"],
             "skills": skills,
             "experience": info.get("experience"),
@@ -297,6 +335,58 @@ def explain_node(state: Dict[str, Any]) -> Dict[str, Any]:
 # ---------------- New: email sender node and persistence helpers ----------------
 _last_state: Dict[str, Any] | None = None  # module-level fallback cache
 _last_state_with_calendar: Dict[str, Any] | None = None
+
+# Path for persisted calendar scheduling state (JSON sanitized subset)
+_CALENDAR_STATE_FILE = Path(__file__).resolve().parent.parent / "data" / "state" / "last_run_with_calendar.json"
+
+def _ensure_calendar_state_dir():
+    try:
+        _CALENDAR_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        print(f"[calendar_state] directory creation failed: {e}")
+
+def _sanitize_for_json(state: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a lightweight JSON-serializable subset of state.
+
+    We only persist appointments + minimal candidate result info to avoid
+    large vector arrays or non-serializable objects.
+    """
+    appointments = state.get("appointments", {}) or {}
+    results_in = state.get("results", []) or []
+    results: List[Dict[str, Any]] = []
+    for r in results_in:
+        results.append({
+            "candidate_id": r.get("candidate_id"),
+            "score": float(r.get("score", 0.0) or 0.0),
+            "email": r.get("email"),
+            "skills": r.get("skills", []),
+        })
+    return {
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "appointments": appointments,
+        "results": results,
+    }
+
+def _persist_calendar_state(state: Dict[str, Any]):
+    _ensure_calendar_state_dir()
+    data = _sanitize_for_json(state)
+    try:
+        _CALENDAR_STATE_FILE.write_text(json.dumps(data, ensure_ascii=False, indent=2))
+        print(f"[calendar_state] persisted to {_CALENDAR_STATE_FILE}")
+    except Exception as e:
+        print(f"[calendar_state] write failed: {e}")
+
+def get_last_calendar_state() -> Dict[str, Any] | None:
+    """Load last persisted calendar state (sanitized) if available; fall back to in-memory."""
+    if _CALENDAR_STATE_FILE.exists():
+        try:
+            return json.loads(_CALENDAR_STATE_FILE.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[calendar_state] read failed: {e}")
+    # fallback to in-memory copy
+    if _last_state_with_calendar is not None:
+        return _sanitize_for_json(_last_state_with_calendar)
+    return None
 
 
 def email_sender_node(state: Dict[str, Any]) -> Dict[str, Any]:
@@ -331,6 +421,10 @@ def email_sender_node(state: Dict[str, Any]) -> Dict[str, Any]:
     emailed_ids: List[Any] = []
     emailed_entries: List[Dict[str, Any]] = []
     by_id = {cv.get("candidate_id"): cv for cv in ranked} if ranked else {}
+    # Name map from results if available
+    name_map = {}
+    for r in state.get("results", []) or []:
+        name_map[r.get("candidate_id")] = r.get("name")
     subject = render_invite_subject(None)
     reply_to = os.getenv("REPLY_TO") or os.getenv("FROM_EMAIL") or os.getenv("SMTP_USER")
     appointments = state.get("appointments", {})  # candidate_id -> {date,time,meeting_link}
@@ -347,10 +441,26 @@ def email_sender_node(state: Dict[str, Any]) -> Dict[str, Any]:
             info = analyzed.get(cid, {})
             email = _extract_email(info.get("full_text", "")) or _extract_email(r.get("explanation", ""))
         if not email:
+            # Fallback: try Qdrant by numeric candidate_id else by point_id
+            tried_lookup = False
             try:
                 email = cv_storage.get_email_by_candidate_id(cid)
+                tried_lookup = True
             except Exception:
                 email = None
+            if not email and cid in by_id:
+                point_id = by_id[cid].get("point_id")
+                if point_id is not None:
+                    try:
+                        pts = cv_storage.client.retrieve(collection_name=cv_storage.collection_name, ids=[point_id], with_payload=True)
+                        for p in pts:
+                            pl = getattr(p, "payload", {}) or {}
+                            e2 = pl.get("email")
+                            if isinstance(e2, str) and "@" in e2:
+                                email = e2.strip()
+                                break
+                    except Exception:
+                        pass
 
         # Prepare body & attempt send (or skip if mailer missing / no email)
         if email and send_email is not None:
@@ -377,7 +487,12 @@ def email_sender_node(state: Dict[str, Any]) -> Dict[str, Any]:
             email = "unknown"
         print(f"Email {status} to {cid} <{email}>")
         emailed_ids.append(cid)
-        emailed_entries.append({"candidate_id": cid, "email": email, "status": status})
+        emailed_entries.append({
+            "candidate_id": cid,
+            "name": name_map.get(cid) or _candidate_name_from_text(r.get("resume_text", "")) or _candidate_name_from_text(r.get("explanation", "")) or "Candidate",
+            "email": email,
+            "status": status,
+        })
 
     summary = f"Attempted interview invitations to {len(emailed_ids)} candidates."
     return {"email_summary": summary, "emailed": emailed_ids, "emailed_entries": emailed_entries}
@@ -408,10 +523,14 @@ def _load_last_state() -> Dict[str, Any] | None:
 
 
 def _save_named_state(name: str, state: Dict[str, Any]):
-    """Attempt to persist a named state using graph.save_state, else keep in memory."""
+    """Attempt to persist a named state using graph.save_state, else keep in memory.
+
+    Additionally persists a sanitized JSON file for calendar state.
+    """
     global _last_state_with_calendar
     if name == "last_run_with_calendar":
         _last_state_with_calendar = state
+        _persist_calendar_state(state)
     if _compiled_graph is not None and hasattr(_compiled_graph, "save_state"):
         try:
             _compiled_graph.save_state(name, state)
@@ -479,8 +598,13 @@ def run_agent(job_desc: str, top_k: int = 5, with_explain: bool = False) -> List
             email = cv.get("email")
             if not email:
                 email = _extract_email(info.get("full_text", "")) or _extract_email(explanation)
+            try:
+                name = _candidate_name_from_text(info.get("full_text", "")) or _candidate_name_from_text(explanation)
+            except Exception:
+                name = None
             results.append({
                 "candidate_id": cv["candidate_id"],
+                "name": name,
                 "score": cv["score"],
                 "skills": info.get("skills", []),
                 "experience": info.get("experience"),
@@ -516,8 +640,13 @@ def run_agent_simple(job_desc: str, top_k: int = 5, with_explain: bool = False) 
         email = cv.get("email")
         if not email:
             email = _extract_email(cv.get("resume_text", "")) or _extract_email(explanation)
+        try:
+            name = _candidate_name_from_text(info.get("full_text", "")) or _candidate_name_from_text(explanation)
+        except Exception:
+            name = None
         results.append({
             "candidate_id": cv["candidate_id"],
+            "name": name,
             "score": cv.get("score", 0.0),
             "skills": info.get("skills", []),
             "experience": info.get("experience"),
@@ -609,5 +738,9 @@ def run_agent_schedule() -> str:
     merged.update(email_out)
     _save_named_state("last_run_with_calendar", merged)
     entries = email_out.get("emailed_entries", [])
-    count = sum(1 for e in entries if e.get("status") == "sent") if entries else 0
-    return f"Interview invites with calendar links sent to {count} candidates."
+    total = len(entries)
+    sent = sum(1 for e in entries if e.get("status") == "sent") if entries else 0
+    if total == 0:
+        return "No candidates to email. Run a search first."
+    # As requested: stop after attempted count only
+    return f"Scheduled and attempted emails for {total} candidates."

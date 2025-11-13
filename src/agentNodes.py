@@ -1,10 +1,16 @@
+import os
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 from collections import Counter
 from ollama import Client
 
-# Initialize Ollama once
-ollama_client = Client()
+# Initialize Ollama once (respect host if provided)
+try:
+    _ollama_host = os.getenv("OLLAMA_HOST")
+    ollama_client = Client(host=_ollama_host) if _ollama_host else Client()
+except Exception:
+    # Defer import/initialization errors to call site
+    ollama_client = None
 
 # -----------------------------
 # CV Analyzer Node
@@ -78,26 +84,53 @@ def rank_candidates(cv_embeddings: list, job_embedding: np.ndarray, candidate_id
 # Explainer Node (Phi3-based)
 # -----------------------------
 def explain_rankingLLM(cv_info: dict, job_desc_clean: str) -> str:
-    """
-    Uses Ollama (phi3) to explain why candidate fits the job.
+    """Explain candidate fit with optional fast path and prompt capping.
+
+    Behavior:
+    - If EXPLAIN_WITH_LLM=0, returns a concise template using extracted skills only.
+    - Otherwise, calls Ollama with shortened resume/job snippets and limited output tokens.
     """
     full_text = (cv_info or {}).get("full_text", "") or ""
+    skills = (cv_info or {}).get("skills", []) or []
     job_text = job_desc_clean or ""
-    if not full_text or not job_text:
-        return "Insufficient data to generate explanation."
-    prompt = f"""
-You are an HR assistant. Explain why this candidate is suitable for the job.
 
-Candidate Resume Text:
-{full_text}
+    # Fast path: disable LLM explanations entirely for speed
+    if os.getenv("EXPLAIN_WITH_LLM", "1") == "0":
+        lead_sk = ", ".join(skills[:5]) if skills else "relevant skills"
+        return f"Skills match: {lead_sk}. Aligned to the role requirements with applicable experience."
+
+    if not full_text or not job_text:
+        # Minimal fallback
+        lead_sk = ", ".join(skills[:5]) if skills else "relevant skills"
+        return f"Skills match: {lead_sk}."
+
+    # Cap prompt sizes to reduce latency
+    max_resume = int(os.getenv("MAX_RESUME_CHARS", "1200"))
+    max_job = int(os.getenv("MAX_JOB_CHARS", "800"))
+    resume_snip = full_text[:max(100, max_resume)]
+    job_snip = job_text[:max(80, max_job)]
+
+    prompt = f"""
+You are an HR assistant. In 2-3 concise sentences, explain why this candidate fits the job.
+
+Resume:
+{resume_snip}
 
 Job Description:
-{job_text}
+{job_snip}
 
-Highlight concrete skills, relevant experience, and alignment with job requirements. Be concise.
+Focus on concrete skills, relevant experience, and clear alignment. Avoid fluff.
 """
     try:
-        resp = ollama_client.generate(model="phi3", prompt=prompt)
+        if ollama_client is None:
+            return "Explanation temporarily unavailable."
+        model_name = os.getenv("OLLAMA_MODEL", "phi3")
+        options = {"num_predict": int(os.getenv("LLM_NUM_PREDICT", "128"))}
+        try:
+            resp = ollama_client.generate(model=model_name, prompt=prompt, options=options)
+        except TypeError:
+            # Older client without options support
+            resp = ollama_client.generate(model=model_name, prompt=prompt)
         return (resp or {}).get("response", "").strip()
     except Exception as e:
         return f"LLM error: {e}"
